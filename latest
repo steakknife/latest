@@ -1,0 +1,1183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Requirements 
+# - bash
+# - curl
+# - jq
+# - git
+# - ruby with gem nokogiri
+# - tail, sort, cat, stat (coreutils)
+# - sed (GNU or *nix)
+# - grep (GNU or *nix)
+
+has() {
+  /usr/bin/env which "$@" >/dev/null 2>&1
+}
+
+UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36'
+
+CMD_REQUIREMENTS=(
+  curl
+  jq
+  git
+  ruby
+  tail
+  sort
+  cat
+  stat
+  sed
+  grep
+)
+
+help() {
+  cat <<-HELP
+
+    Usage: $(basename "$0") [options...] [packages...]
+
+    Options
+
+    -h, --help    This help
+
+    -l, --list    List all package names
+    -a, --all     List all package names with versions (default if no arguments)
+    -e, --empty   List all package names with empty versions (for debugging)
+
+    -c, --csv     Output in CSV format
+    -j, --json    Output in JSON format
+    -t, --toml    Output in TOML format
+    -x, --xml     Output in XML format
+    -y, --yaml    Output in YAML format
+
+    Cached web requests are located at $(cache_dir)
+
+HELP
+}
+
+check_requirements() {
+  local FATAL=
+  local CMD
+  for CMD in "${CMD_REQUIREMENTS[@]}"; do
+    if ! has "$CMD"; then
+      err "Missing required command $CMD"
+      FATAL=1
+    fi
+  done
+  if [ -n "$FATAL" ]; then
+    exit 1
+  fi
+}
+
+err() {
+  echo >&2 "$@"
+}
+
+debug() {
+  if [ -n "${DEBUG_LATEST-}" ]; then
+    err "$@"
+  fi
+}
+
+fatal() {
+  err "$@"
+  exit 1
+}
+
+raw_fetch() {
+  if ! curl -A "$UA" -fsL "$1"; then
+    err "Failed to retrieve $1"
+    return 1
+  fi
+}
+
+cache_dir() {
+  local dir="${XDG_CACHE_DIR:-$HOME/.cache}/$(basename "$0")"
+  mkdir -p "$dir"
+  echo "$dir"
+}
+
+# in seconds
+file_age() {
+  local mtime=$(stat -f %m "$1" 2>/dev/null)
+  local now=$(date +%s)
+  echo $((now - mtime))
+}
+
+cache_save() {
+  tee "$1"
+  if [[ ! -s "$1" ]]; then
+    debug "Removing empty file $1"
+    rm -f "$1"
+  fi
+}
+
+fetch() {
+  local cache_file="$(cache_dir)"/"${1//\//_}"
+  if [[ -e "$cache_file" && $(file_age "$cache_file") -lt 3600 ]]; then
+    debug "using cached file $cache_file"
+    cat "$cache_file"
+  else
+    debug "fetching $1 -> $cache_file"
+    (set +e
+    raw_fetch "$1" | cache_save "$cache_file"
+    )
+  fi
+}
+
+
+gnu() {
+  fetch "https://ftp.gnu.org/gnu/$1" | grep -Eo "${2:-$1}-[0-9][0-9.]*[a-z0-9]+${3:-\.tar}" | grep -Eo '[0-9][0-9.]*[a-z0-9]+' | sed "s/${3:-\.tar}$//" | sort -V | tail -1
+}
+
+savannah_gnu() {
+  fetch "https://download.savannah.gnu.org/releases/$1" | grep -Eo "${2:-$1}-[0-9][0-9.]*[a-z0-9]+\.tar" | grep -Eo '[0-9][0-9.]*[a-z0-9]+' | sed 's/\.tar$//' | sort -V | tail -1
+}
+
+github() {
+  fetch "https://api.github.com/repos/$1/tags" | jq -r 'map(.name) | "\(.[])"' #sed '/name/!d;s/[[:space:]]*"name": "//;s/",$//'
+}
+
+_git() {
+  git ls-remote --tags "$1" | cut -f2 | sed '/^refs\/tags\//!d;s!^refs/tags/!!'
+}
+
+# $1 = base url
+# $2 = project
+gitlab() {
+  fetch "https://$1/api/v4/projects/${2//\//%2F}/repository/tags" | jq -r 'map(.name) | (.[])'
+}
+
+jdk_maj_vers() {
+  fetch 'https://www.azul.com/wp-admin/admin-ajax.php?action=bundles&endpoint=community&use_stage=false&include_fields=java_version%2Copenjdk_build_number%2Csupport_term' | jq 'map(select(.support_term == "lts")) | map(.java_version[0]) | unique' | grep -Eo '[0-9]+'
+}
+
+jdk() {
+   fetch 'https://www.azul.com/wp-admin/admin-ajax.php?action=bundles&endpoint=community&use_stage=false&include_fields=java_version%2Copenjdk_build_number%2Csupport_term' | grep '"name"' | grep "jdk$1" | sed -E '/-fx-/d;/-hl-/d;s/-(linux|macos|win|solaris).*",//;s/[[:space:]]+"name": "//;s/^zulu//;s/[[:space:]]+$//' | sort -V | tail -1
+}
+
+jdk_list() {
+  jdk_maj_vers | sed 's/^/jdk/'
+}
+
+sf() {
+  fetch "https://sf.net/projects/${1}/files/${2-}" | grep -oE "/files/${2-}/?${3:-[0-9.-]+}" | sed -E "s!/files/${2-}/?!!" | grep -Eo '[0-9.]+[0-9]' | sort -V | tail -1
+}
+
+pg_maj_vers() {
+  fetch https://www.postgresql.org/support/versioning/ | grep -B2 Yes | sed -E '/>[0-9]+</!d;s/.*>([0-9]+).*/\1/'
+}
+
+pg() {
+  fetch https://www.postgresql.org/support/versioning/ | grep -B1 Yes | sed -E "/[0-9]/!d;s/.*>([0-9.]+).*/\\1/;/^$1/!d"
+}
+
+pg_list() {
+  pg_maj_vers | sed 's/^/postgresql/'
+}
+
+tcl() {
+  fetch 'https://core.tcl-lang.org/tk/taglist' | sed -E "/core-[0-9-]+</!d;s/core-([0-9-]+)<.*/\1/;s/-/./g;/^$VER/!d" | sort -V | tail -1
+}
+
+tcl_maj_vers() {
+  fetch 'https://core.tcl-lang.org/tcl/wiki?name=Index' | grep -i release | grep Tcl | grep -Eo '[0-9]+\.[0-9]+'
+}
+
+tcl_list() {
+  tcl_maj_vers | sed 's/^/tcl/'
+}
+
+nodejs() {
+  fetch https://nodejs.org/download/release/latest-v${VER}.x/ | sed -E '/node-v[0-9.]+\.tar\.gz/!d;s/[^0-9]*([0-9.]+)\.tar\.gz.*/\1/'
+}
+
+nodejs_maj_vers() {
+  fetch https://nodejs.dev/en/download/ | grep -Eo 'v[0-9]+[^0-9]+LTS' | grep -Eo '[0-9]+'
+}
+
+nodejs_list() {
+  nodejs_maj_vers | sed 's/^/nodejs/'
+}
+
+# protocol-numbers
+protocols() {
+  fetch 'https://gist.githubusercontent.com/steakknife/b0fafe5eef795452cbf43676f87f55ee/raw/gen-protocol-numbers' | ruby | grep updated | grep -Eo '[0-9-]+'
+}
+
+# service-names-port-numbers
+services() {
+  fetch 'https://gist.githubusercontent.com/steakknife/1ce329ff44924199b1dac8233c38d50c/raw/gen-service-names-port-numbers' | ruby | grep updated | grep -Eo '[0-9-]+'
+}
+
+iana-etc() {
+  {
+    protocols
+    services
+  } | sort -V | tail -1
+}
+
+all_serial() {
+  pkgs $(list)
+}
+
+all_parallel() {
+  local PIDS=()
+  local PKG
+  for PKG in $(list); do
+    ver "$PKG" &
+    PIDS+=($!)
+  done
+  wait "${PIDS[@]}"
+}
+
+all() {
+  if [ -z "${DISABLE_PARALLEL-}" ]; then
+    all_parallel | sort -V
+  else
+    all_serial
+  fi
+}
+
+empty() {
+  diff -u <(list) <(all | sed 's/ .*//' | sort -V) | sed '/^-[a-z0-9]/!d;s/^-//'
+}
+
+category_build() {
+  case "$1" in
+  ant)
+    ;;
+  maven)
+    ;;
+  cmake)
+    fetch https://cmake.org/download/ | grep -Eo 'Latest Release[^)]+' | sed 's/.*(//;s/(.*//'
+    ;;
+  wheel)
+    ;;
+  pip)
+    ;;
+  meson)
+    github 'mesonbuild/meson' | grep -v '[a-z]' | sort -V | tail -1
+    ;;
+  samurai)
+    github 'michaelforney/samurai' | sort -V | tail -1
+    ;;
+  autoconf|automake|libtool|m4|make)
+    gnu "$1"
+    ;;
+  pkg-config)
+    gitlab 'gitlab.freedesktop.org' 'pkg-config/pkg-config' | sed '/^pkg-config-/!d;s/^pkg-config-//' | sort -V | tail -1
+    ;;
+  scons)
+    ;;
+  *) return 1
+  esac
+}
+
+category_lang() {
+  case "$1" in
+  nasm)
+    github 'netwide-assembler/nasm' | sed -E '/^nasm-/!d;/rc/d;s/^nasm-//' | sort -V | tail -1
+    ;;
+  yasm)
+    github 'yasm/yasm' | sed -E '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  elfutils)
+    fetch 'https://sourceware.org/elfutils/ftp/' | sed -E '/.*>[0-9.]+\/<.*/!d;s/.*>([0-9.]+)\/<.*/\1/g' | sort -V | tail -1
+    ;;
+  binutils)
+    gnu "$1"
+    ;;
+  gcc)
+    gnu gcc gcc \\/
+    ;;
+  vala)
+    gitlab 'gitlab.gnome.org' 'GNOME/vala' | sort -V | tail -1
+    ;;
+  slang)
+    ;;
+  llvm|clang)
+    github 'llvm/llvm-project' | sed -E '/^llvmorg-[0-9.]+$/!d;s/llvmorg-//' | sort -V | tail -1
+    ;;
+  guile)
+    gnu "$1"
+    ;;
+  lua)
+    ;;
+  ruby)
+    fetch https://ruby-lang.org/en/downloads/ | grep -Eo 'The current stable version is [0-9.]+' | sed 's/.* is //;s/\.$//'
+    ;;
+  perl)
+    fetch https://perl.org/get.html | grep -Eo 'www\.cpan\.org/src/5\.0/perl-[0-9.]+\.tar\.gz' | sed 's/.*perl-//;s/\.tar\.gz//' | tail -1
+    ;;
+  golang)
+    ;;
+  erlang)
+    fetch https://erlang.org/downloads | sed -E '/The latest.*>[0-9][0-9.]+[0-9]</!d;s/.*>([0-9][0-9.]+)<.*/\1/'
+    ;;
+  elixir)
+    fetch https://elixir-lang.org/install.html | sed -E '/\.tar\.gz/!d;s/.+v([0-9.]+)\.tar\.gz.*/\1/'
+    ;;
+  python)
+    fetch https://www.python.org/downloads/ | sed -E '/Download Python /!d;/tar/!d;s/.*Download Python (.*)<.*/\1/'
+    ;;
+  js) # spidermonkey
+    ;;
+  nodejs*)
+    VER=${1#nodejs}
+    RES=$(nodejs "$VER")
+    if [[ -n "$VER" && -n "$RES" ]]; then
+      echo "$RES"
+    else
+      return 1
+    fi
+    ;;
+  jdk*)
+    VER=${1#jdk}
+    RES=$(jdk "$VER")
+    if [[ -n "$VER" && -n "$RES" ]]; then
+      echo "$RES"
+    else
+      return 1
+    fi
+    ;;
+  tcl*)
+    VER=${1#tcl}
+    RES=$(tcl "$VER")
+    if [[ -n "$VER" && -n "$RES" ]]; then
+      echo "$RES"
+    else
+      return 1
+    fi
+    ;;
+  *) return 1
+  esac
+}
+
+category_search() {
+  case "$1" in
+  meilisearch)
+    github 'meilisearch/meilisearch' | sed -E '/^v[0-9.]+$/!d;s/^v//' | sort -V | tail -1 
+    ;;
+  elasticsearch)
+    ;;
+  sphinxsearch)
+    ;;
+  clucene)
+    ;;
+  lucene)
+    ;;
+  solr)
+    ;;
+  xapian)
+    ;;
+  *) return 1
+  esac
+}
+
+category_msg() {
+  case "$1" in
+  kafka)
+    ;;
+  rabbitmq)
+    ;;
+  zookeeper)
+    ;;
+  mosquitto)
+    ;;
+  *) return 1
+  esac
+}
+
+category_nosql() {
+  case "$1" in
+  memcached)
+    ;;
+  libmemcache) # -awesome
+    ;;
+  hiredis)
+    ;;
+  redis)
+    fetch https://redis.io/download/ | grep -Eo 'Download [0-9.]+' | tail -1 | grep -o '[0-9][0-9.]*[0-9]'
+    ;;
+  couchbase)
+    ;;
+  cassandra)
+    ;;
+  *) return 1
+  esac
+}
+
+category_db() {
+  case "$1" in
+  maria-db)
+    ;;
+  openldap)
+    ;;
+  postgresql*)
+    VER="${1#postgresql}"
+    RES=$(pg "$VER")
+    if [[ -n "$VER" && -n "$RES" ]]; then
+      echo "$RES"
+    else
+      return 1
+    fi
+    ;;
+  sqlite)
+    fetch 'https://sqlite.org' | sed -E '/Version/!d;s/.*Version ([0-9.]+).*/\1/'
+    ;;
+  lmdb)
+    ;;
+  unixodbc)
+    ;;
+  gdbm)
+    gnu "$1"
+    ;;
+  *) return 1
+  esac
+}
+
+category_http() {
+  case "$1" in
+  nginx)
+    fetch https://nginx.org/en/download.html | grep -Eo '<h4>Stable version</h4></center><table width="100%"><tr><td width="20%"><a href="/en/CHANGES-[0-9.]+">CHANGES-[0-9.]+</a></td><td width="20%"><a href="/download/nginx-[0-9.]+\.tar\.gz'  | grep -o 'nginx-.*\.tar\.gz' | grep -o '[0-9][0-9.]*[0-9]'
+    ;;
+  apache-httpd)
+    ;;
+  wget)
+    gnu "$1"
+    ;;
+  wget2)
+    gnu wget wget2
+    ;;
+  curl)
+    ;;
+  aria2)
+    ;;
+  nghttp2)
+    ;;
+  ngtcp2)
+    ;;
+  quiche)
+    ;;
+  libmetalink)
+    ;;
+  w3m)
+    ;;
+  lynx)
+    ;;
+  *) return 1
+  esac
+}
+
+category_log() {
+  case "$1" in
+  rsyslog)
+    ;;
+  logstash)
+    ;;
+  fluentd)
+    ;;
+  fluentbit)
+    ;;
+  *) return 1
+  esac
+}
+
+category_sec() {
+  case "$1" in
+  acl|attr)
+    savannah_gnu "$1"
+    ;;
+  acct|gnutls|gperf|libtasn1|nettle)
+    gnu "$1"
+    ;;
+  cyrus-sasl)
+    ;;
+  libb2)
+    ;;
+  modsecurity)
+    ;;
+  modsecurity_ngx)
+    ;;
+  keyutils)
+    ;;
+  libssh2)
+    ;;
+  openssh)
+    fetch 'https://openssh.com' | sed -E '/OpenSSH [0-9]/!d;s/.*OpenSSH ([0-9.]+).*/\1/'
+    ;;
+  openssl)
+    fetch https://www.openssl.org/source/ | grep -Eo 'openssl-[0-9.]+\.tar\.gz' | grep -o '[0-9][0-9.]*[0-9]' | sort -V | tail -1
+    ;;
+  pam)
+    github 'linux-pam/linux-pam' | sed -E '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  gpgme)
+    ;;
+  gpg)
+    ;;
+  libgcrypt)
+    ;;
+  libgpg-error)
+    ;;
+  libassuan)
+    ;;
+  libksba)
+    ;;
+  libseccomp)
+    ;;
+  pinentry)
+    ;;
+  p11-kit)
+    ;;
+  opensc)
+    ;;
+  libp11)
+    ;;
+  pam-pkcs11)
+    ;;
+  openct)
+    ;;
+  nss)
+    ;;
+  haveged)
+    ;;
+  polkit)
+    ;;
+  sudo)
+    ;;
+  stunnel)
+    ;;
+  socat)
+    ;;
+  nmap)
+    ;;
+  cryptsetup)
+    ;;
+  audit)
+    github 'linux-audit/audit-userspace' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  shadow)
+    github 'shadow-maint/shadow' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  rsyslog)
+    ;;
+  logstash)
+    ;;
+  fluentd)
+    ;;
+  fluentbit)
+    ;;
+  *) return 1
+  esac
+}
+
+category_editor() {
+  case "$1" in
+  emacs|nano)
+    gnu "$1"
+    ;;
+  vim)
+    ;;
+  neovim)
+    ;;
+  *) return 1
+  esac
+}
+
+category_term() {
+  case "$1" in
+  screen|ncurses|readline)
+    gnu "$1"
+    ;;
+  newt)
+    ;;
+  tmux)
+    ;;
+  less)
+    gnu "$1"
+    ;;
+  libedit)
+    fetch 'https://www.thrysoee.dk/editline/' | grep -Eo 'libedit-[0-9.-]+\.tar\.gz' | sed 's/libedit-//;s/\.tar\.gz//' | tail -1
+    ;;
+  *) return 1
+  esac
+}
+
+category_xml() {
+  case "$1" in
+  sgml-common)
+    ;;
+  opensp)
+    ;;
+  expat)
+    ;;
+  libxml2)
+    gitlab 'gitlab.gnome.org' 'GNOME/libxml2' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  libxslt)
+    gitlab 'gitlab.gnome.org' 'GNOME/libxslt' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  xerces)
+    ;;
+  saxon)
+    ;;
+  lxml)
+    ;;
+  *) return 1
+  esac
+}
+
+category_json() {
+  case "$1" in
+  jansson)
+    ;;
+  json-c)
+    ;;
+  *) return 1
+  esac
+}
+
+category_yaml() {
+  case "$1" in
+  libyaml)
+    ;;
+  pyyaml)
+    ;;
+  *) return 1
+  esac
+}
+
+category_unicode() {
+  case "$1" in
+  icu)
+    ;;
+  libidn|libunistring)
+    gnu "$1"
+    ;;
+  libidn2)
+    gnu libidn libidn2
+    ;;
+  *) return 1
+  esac
+}
+
+category_i18n() {
+  case "$1" in
+  gettext)
+    gnu "$1"
+    ;;
+  intltool)
+    ;;
+  *) return 1
+  esac
+}
+
+category_regex() {
+  case "$1" in
+  *) return 1
+  esac
+}
+
+category_doc() {
+  case "$1" in
+  docbook-xml)
+    ;;
+  docbook-xsl-nons)
+    ;;
+  docbook-utils)
+    ;;
+  docbook-dsssl)
+    ;;
+  docbook-3.1-dtd)
+    ;;
+  docbook-4.5-dtd)
+    ;;
+  openjade)
+    ;;
+  xmlto)
+    ;;
+  fop)
+    ;;
+  sphinx)
+    ;;
+  groff|texinfo)
+    gnu "$1"
+    ;;
+  asciidoctor)
+    ;;
+  asciidoc)
+    ;;
+  doxygen)
+    ;;
+  ghostscript)
+    ;;
+  man-pages)
+    ;;
+  man-db)
+    savannah_gnu "$1"
+    ;;
+  *) return 1
+  esac
+}
+
+category_txt() {
+  case "$1" in
+  flex)
+    github 'westes/flex' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  pcre2)
+    github 'PCRE2Project/pcre2' | sed '/^pcre2-/!d;s/^pcre2-//;/RC/d' | sort -V | tail -1
+    ;;
+  re2)
+    ;;
+  oniguruma)
+    ;;
+  hyperscan)
+    ;;
+  vectorscan)
+    ;;
+  re-flex)
+    github 'Genivia/RE-flex' | sed 's/^v//' | sort -V | tail -1
+    ;;
+  expect)
+    sf 'expect' 'Expect'
+    ;;
+  aspell|bison|diffutils|ed|gawk|grep|patch|sed|sharutils)
+    gnu "$1"
+    ;;
+  enchant)
+    ;;
+  *) return 1
+  esac
+}
+
+category_shell() {
+  case "$1" in
+  bash)
+    BASH_VER=$(gnu bash)
+    BASH_PATCH=$(fetch "https://ftp.gnu.org/gnu/bash/bash-${BASH_VER}-patches/" 2>/dev/null | grep -oE 'bash[0-9-]+' | sed 's/bash//' | sort -V | tail -1 || true)
+    echo "${BASH_PATCH:-$BASH_VER}"
+    ;;
+  zsh)
+    sf zsh zsh
+    ;;
+  *) return 1
+  esac
+}
+
+category_storage() {
+  case "$1" in
+  nfs-utils)
+    _git 'git://git.linux-nfs.org/projects/steved/nfs-utils.git' | sed '/^nfs-utils-/!d;s/^nfs-utils-//;/rc/d;s/-/./g' | sort -V | tail -1
+    ;;
+  rpcbind)
+    _git 'git://git.linux-nfs.org/projects/steved/rpcbind.git' | sed '/^rpcbind-/!d;s/^rpcbind-//;/rc/d;s/_/./g' | sort -V | tail -1
+    ;;
+  libtirpc)
+    _git 'git://git.linux-nfs.org/projects/steved/libtirpc.git' | sed '/^libtirpc-/!d;s/^libtirpc-//;/rc/d;s/-/./g' | sort -V | tail -1
+    ;;
+  nfs4-acl-tools)
+    _git 'git://git.linux-nfs.org/projects/steved/nfs4-acl-tools.git' | sed '/^nfs4-acl-tools-/!d;s/^nfs4-acl-tools-//;/rc/d' | sort -V | tail -1
+    ;;
+  xfsprogs)
+    fetch 'https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs' | sed -E '/xfsprogs-/!d;s/.*xfsprogs-([0-9.]+[0-9]).*/\1/' | sort -V | tail -1
+    ;;
+  xfsdump)
+    fetch 'https://www.kernel.org/pub/linux/utils/fs/xfs/xfsdump' | sed -E '/xfsdump-/!d;s/.*xfsdump-([0-9.]+[0-9]).*/\1/' | sort -V | tail -1
+    ;;
+  e2fsprogs)
+    ;;
+  btrfs-progs)
+    ;;
+  dosfstools)
+    ;;
+  mdadm)
+    fetch 'https://kernel.org/pub/linux/utils/raid/mdadm/' | sed -E '/mdadm-/!d;/rc/d;s/.*mdadm-([0-9.]+[0-9]).*/\1/' | sort -V | tail -1
+    ;;
+  samba)
+    ;;
+  squashfs-tools-ng)
+    github 'AgentD/squashfs-tools-ng' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  findutils|grub|mtools|parted)
+    gnu "$1"
+    ;;
+  hdparm)
+    ;;
+  ceph)
+    ;;
+  rsync)
+    ;;
+  *) return 1
+  esac
+}
+
+category_dns() {
+  case "$1" in
+  bind)
+    ;;
+  pdns-authoritative)
+    ;;
+  pdns-recursor)
+    ;;
+  c-ares)
+    ;;
+  *) return 1
+  esac
+}
+
+category_net() {
+  case "$1" in
+  iftop)
+    ;;
+  bwm-ng)
+    ;;
+  iperf3)
+    ;;
+  ipvsadm)
+    ;;
+  libpcap)
+    ;;
+  libnl)
+    ;;
+  libpsl)
+    ;;
+  iproute2)
+    ;;
+  *) return 1
+  esac
+}
+
+category_compress() {
+  case "$1" in
+  zstd)
+    github 'facebook/zstd' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  lz4)
+    github 'lz4/lz4' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  lzo)
+    ;;
+  pigz)
+    fetch 'https://zlib.net/pigz' | sed -E '/source code version/!d;s/.*source code version ([0-9.]+).*/\1/'
+    ;;
+  bzip2)
+    ;;
+  pbzip2)
+    fetch 'https://launchpad.net/pbzip2/' | sed -E '/Latest version is [0-9.]+/!d;s/[^0-9]*([0-9.]+).*/\1/'
+    ;;
+  lbzip2)
+    github 'kjn/lbzip2' | sed -E '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  p7zip)
+    ;;
+  xz-utils)
+    sf 'lzmautils' '' 'xz-[0-9.]+'
+    ;;
+  snappy)
+    github 'google/snappy' | sort -V | tail -1
+    ;;
+  brotli)
+    github 'google/brotli' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  unzip)
+    ;;
+  unrar)
+    ;;
+  zip)
+    ;;
+  cpio|gzip|tar)
+    gnu "$1"
+    ;;
+  libarchive)
+    ;;
+  *) return 1
+  esac
+}
+
+category_math() {
+  case "$1" in
+  mpdecimal)
+    ;;
+  bc|gmp|gsl|mpc|mpfr)
+    gnu "$1"
+    ;;
+  openmpi)
+    ;;
+  *) return 1
+  esac
+}
+
+category_base() {
+  case "$1" in
+  coreutils|glibc|inetutils|parallel|which)
+    gnu "$1"
+    ;;
+  file)
+    fetch 'https://astron.com/pub/file/' | sed -E '/file-[0-9]/!d;s/.*file-([0-9.]+)\.tar\.gz.*/\1/' | sort -V | tail -1
+    ;;
+  iana-etc)
+    iana-etc
+    ;;
+  kmod)
+    ;;
+  kbd)
+    ;;
+  util-linux)
+    #fetch 'https://kernel.org/pub/linux/utils/util-linux'
+    ;;
+  *) return 1
+  esac
+}
+
+category_admin() {
+  case "$1" in
+  time)
+    gnu "$1"
+    ;;
+  lsof)
+    github 'lsof-org/lsof' | sed '/-freebsd/d' | sort -V | tail -1
+    ;;
+  htop)
+    github 'htop-dev/htop' | sort -V | tail -1
+    ;;
+  sysstat)
+    ;;
+  procps-ng)
+    ;;
+  psmisc)
+    ;;
+  docker-desktop)
+    ;;
+  docker-engine)
+    ;;
+  kubernetes)
+    ;;
+  helm)
+    ;;
+  *) return 1
+  esac
+}
+
+category_debug() {
+  case "$1" in
+  valgrind)
+    ;;
+  gdb)
+    gnu "$1"
+    ;;
+  *) return 1
+  esac
+}
+
+category_email() {
+  case "$1" in
+  postfix)
+    ;;
+  dovecot)
+    ;;
+  zimbra)
+    ;;
+  roundcube)
+    ;;
+  owncloud)
+    ;;
+  *) return 1
+  esac
+}
+
+category_concurrency() {
+  case "$1" in
+  libatomic_ops)
+    github 'ivmai/libatomic_ops' | sed 's/^v//;/libatomic_ops-/d' | sort -V | tail -1
+    ;;
+  libsigsegv|pth)
+    gnu "$1"
+    ;;
+  libpipeline|libunwind)
+    savannah_gnu "$1"
+    ;;
+  libuv)
+    ;;
+  libevent)
+    ;;
+  npth)
+    ;;
+  libaio)
+    ;;
+  *) return 1
+  esac
+}
+
+category_lint() {
+  case "$1" in
+  *) return 1
+  esac
+}
+
+category_test() {
+  case "$1" in
+  check)
+    ;;
+  dejagnu)
+    github 'git/git' | sed -E '/^v[0-9.]+$/!d;s/^v//' | sort -V | tail -1 
+    ;;
+  *) return 1
+  esac
+}
+
+category_dev() {
+  case "$1" in
+  git)
+    github 'git/git' | sed -E '/^v[0-9.]+$/!d;s/^v//' | sort -V | tail -1 
+    ;;
+  *) return 1
+  esac
+}
+
+category_image() {
+  case "$1" in
+  qrencode)
+    ;;
+  libpng)
+    ;;
+  libjpeg-turbo)
+    ;;
+  librsvg)
+    ;;
+  libtiff)
+    ;;
+  libwebp)
+    ;;
+  giflib)
+    ;;
+  jasper)
+    ;;
+  pango)
+    ;;
+  cairo)
+    ;;
+  fontconfig)
+    ;;
+  freetype)
+    ;;
+  fribidi)
+    ;;
+  harfbuzz)
+    ;;
+  graphite2)
+    ;;
+  graphviz)
+    ;;
+  pixman)
+    ;;
+  cogl)
+    ;;
+  graphene)
+    ;;
+  *) return 1
+  esac
+}
+
+category_misc() {
+  case "$1" in
+  libmaxminddb)
+    ;;
+  swig)
+    ;;
+  libffi)
+    github 'libffi/libffi' | sed '/^v/!d;s/^v//' | sort -V | tail -1
+    ;;
+  gc)
+    ;;
+  talloc)
+    ;;
+  apr)
+    ;;
+  apr-util)
+    ;;
+  nspr)
+    ;;
+  glib2)
+    gitlab 'gitlab.gnome.org' 'GNOME/glib' | sort -V | tail -1
+    ;;
+  libsigc++)
+    ;;
+  boost)
+    ;;
+  *) fatal "unknown package '$1'"
+  esac
+}
+
+heading() {
+  sed "s/^/$1 /"
+}
+
+ver() {
+  for CAT in $(grep -oE '^category_[a-z0-9]+' "$0"); do
+    "$CAT" "$1" && break
+  done | heading "$1"
+}
+
+list() {
+  {
+    sed -E '/--/d;/^[[:space:]]+[a-z0-9|+-]+)$/!d;s/)$//;s/\|/\n/g;s/^[[:space:]]+//' "$0"
+    nodejs_list
+    pg_list
+    jdk_list
+    tcl_list
+  } | sort -V
+}
+
+formatter() {
+  if [ "$FORMAT" = text ]; then
+    sed -E 's/^([^ ]+) (.+)/\1: \2/'
+  elif [ "$FORMAT" = csv ]; then
+    sed -E 's/^([^ ]+) (.+)/"\1","\2"/'
+  elif [ "$FORMAT" = json ]; then
+    sed -E 's/^([^ ]+) (.+)/"\1": "\2",/;1s/^/{\n/;$s/,$/\n}/'
+  elif [ "$FORMAT" = toml ]; then
+    sed -E 's/^([^ ]+) (.+)/\1 = '\''\2'\''/'
+  elif [ "$FORMAT" = xml ]; then
+    sed -E 's/^([^ ]+) (.+)/  <package name="\1" version="\2"\/>/;$s/$/\n<\/latest>/;1s/^/<?xml version="1.0" encoding="UTF-8" ?>\n<latest>\n/'
+  elif [ "$FORMAT" = yaml ]; then
+    sed -E 's/^([^ ]+) (.+)/\1: '\''\2'\''/;1s/^/---\n/'
+  fi
+}
+
+pkgs() {
+  local ARG
+  for ARG in "$@"; do
+    ver "$ARG"
+  done
+}
+
+check_requirements
+
+CMD=
+ARGS=()
+FORMAT=text
+
+for ARG in "$@"; do
+  case "$ARG" in
+  csv|-c|--csv) FORMAT=csv ;;
+  json|-j|--json) FORMAT=json ;;
+  toml|-t|--toml) FORMAT=toml ;;
+  xml|-x|--xml) FORMAT=xml ;;
+  yaml|-y|--yaml) FORMAT=yaml ;;
+  all|-a|--all) CMD=all ;;
+  list|-l|--list) CMD=list ;;
+  empty|-e|--empty) CMD=empty ;;
+  help|-h|--help) CMD=help ;;
+  *) ARGS+=("$ARG") CMD=${CMD:-pkgs}
+  esac
+done
+
+CMD=${CMD:-all}
+
+if [[ "$CMD" = all || "$CMD" = pkgs ]]; then
+  "$CMD" "${ARGS[@]}" | formatter
+else
+  "$CMD"
+fi
