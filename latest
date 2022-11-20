@@ -7,7 +7,7 @@ set -euo pipefail
 # - jq
 # - git
 # - ruby with gem nokogiri
-# - tail, sort, cat, stat (coreutils)
+# - tail, cut, sort, cat, stat, date (coreutils)
 # - sed (GNU or *nix)
 # - grep (GNU or *nix)
 
@@ -23,9 +23,11 @@ CMD_REQUIREMENTS=(
   git
   ruby
   tail
+  cut
   sort
   cat
   stat
+  date
   sed
   grep
 )
